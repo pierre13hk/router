@@ -67,9 +67,7 @@ impl VllmPDRouter {
     /// Supported format: `"host:IP,handshake:PORT,notify:PORT"`.
     /// Returns `(None, None, None)` for any other format
     /// so that non-MoRIIO connectors (e.g. NixlConnector) are unaffected.
-    fn parse_moriio_zmq_address(
-        zmq_address: &str,
-    ) -> (Option<String>, Option<u16>, Option<u16>) {
+    fn parse_moriio_zmq_address(zmq_address: &str) -> (Option<String>, Option<u16>, Option<u16>) {
         let mut host = None;
         let mut handshake_port = None;
         let mut notify_port = None;
@@ -429,8 +427,7 @@ impl VllmPDRouter {
         let mut prefill_request = Self::prepare_prefill_request(request_json.clone(), path);
 
         // Populate kv_transfer_params for the prefill instance.
-        prefill_request["kv_transfer_params"] =
-            Self::build_prefill_kv_transfer_params(decode_zmq);
+        prefill_request["kv_transfer_params"] = Self::build_prefill_kv_transfer_params(decode_zmq);
 
         debug!(
             "Added kv_transfer_params to prefill request: {}",
