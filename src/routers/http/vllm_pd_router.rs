@@ -95,7 +95,7 @@ impl VllmPDRouter {
     /// MoRIIO connectors (detected by a `"handshake:PORT"` key in the zmq_address)
     /// additionally receive a `transfer_id` for correlating the prefill and decode
     /// legs.
-    fn build_prefill_kv_transfer_params(decode_zmq: &str) -> Value {
+    fn build_prefill_kv_transfer_params(decode_zmq: &str, remote_dp_size: usize) -> Value {
         let mut params = json!({
             "do_remote_decode": true,
             "do_remote_prefill": false,
@@ -111,6 +111,7 @@ impl VllmPDRouter {
                 MORIIO_TRANSFER_PREFIX,
                 Uuid::new_v4().to_string().replace('-', "")
             ));
+            params["remote_dp_size"] = json!(remote_dp_size);
         }
 
         params
@@ -427,7 +428,8 @@ impl VllmPDRouter {
         let mut prefill_request = Self::prepare_prefill_request(request_json.clone(), path);
 
         // Populate kv_transfer_params for the prefill instance.
-        prefill_request["kv_transfer_params"] = Self::build_prefill_kv_transfer_params(decode_zmq);
+        prefill_request["kv_transfer_params"] =
+            Self::build_prefill_kv_transfer_params(decode_zmq, self.intra_node_data_parallel_size);
 
         debug!(
             "Added kv_transfer_params to prefill request: {}",
@@ -544,7 +546,13 @@ impl VllmPDRouter {
 
         // Prepare decode request with kv_transfer_params from prefill response at top level
         let mut decode_request = request_json.clone();
-        if let Some(params) = kv_transfer_params {
+        if let Some(mut params) = kv_transfer_params {
+            // Inject remote_dp_size (prefill's dp_size) so the decode connector
+            // knows how many prefill DP ranks to handshake with.
+            if params.get("transfer_id").is_some() {
+                // Only for MoRIIO (transfer_id present); other connectors don't use this field.
+                params["remote_dp_size"] = json!(self.intra_node_data_parallel_size);
+            }
             decode_request["kv_transfer_params"] = params;
             debug!("Added kv_transfer_params to decode request");
         }
@@ -762,7 +770,7 @@ impl VllmPDRouter {
         // currently supported.  MoRIIO WRITE mode requires a concurrent flow and
         // is not yet implemented here.
         prefill_request["kv_transfer_params"] =
-            Self::build_prefill_kv_transfer_params(&decode_zmq_addr);
+            Self::build_prefill_kv_transfer_params(&decode_zmq_addr, self.intra_node_data_parallel_size);
 
         debug!(
             "Added kv_transfer_params to prefill request: {}",
@@ -914,7 +922,13 @@ impl VllmPDRouter {
 
         // Stage 2: Prepare decode request with kv_transfer_params from prefill response at top level
         let mut decode_request = original_request.clone();
-        if let Some(params) = kv_transfer_params {
+        if let Some(mut params) = kv_transfer_params {
+            // Inject remote_dp_size (prefill's dp_size) so the decode connector
+            // knows how many prefill DP ranks to handshake with.
+            if params.get("transfer_id").is_some() {
+                // Only for MoRIIO (transfer_id present); other connectors don't use this field.
+                params["remote_dp_size"] = json!(self.intra_node_data_parallel_size);
+            }
             decode_request["kv_transfer_params"] = params;
             debug!("Added kv_transfer_params to decode request");
         }
@@ -1987,5 +2001,23 @@ mod tests {
         let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
         assert_eq!(result["stream"], false);
         assert!(result.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn test_build_prefill_kv_transfer_params_moriio_includes_remote_dp_size() {
+        // MoRIIO zmq address contains a "handshake:PORT" segment.
+        let moriio_zmq = "tcp://10.0.0.1:5555,handshake:6000";
+        let params = VllmPDRouter::build_prefill_kv_transfer_params(moriio_zmq, 4);
+        assert_eq!(params["remote_dp_size"], 4);
+        assert!(params.get("transfer_id").is_some(), "transfer_id should be set for MoRIIO");
+    }
+
+    #[test]
+    fn test_build_prefill_kv_transfer_params_non_moriio_no_remote_dp_size() {
+        // Non-MoRIIO zmq address has no "handshake:" segment.
+        let plain_zmq = "tcp://10.0.0.1:5555";
+        let params = VllmPDRouter::build_prefill_kv_transfer_params(plain_zmq, 4);
+        assert!(params.get("remote_dp_size").is_none(), "remote_dp_size should not be set for non-MoRIIO");
+        assert!(params.get("transfer_id").is_none(), "transfer_id should not be set for non-MoRIIO");
     }
 }
