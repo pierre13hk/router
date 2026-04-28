@@ -250,6 +250,7 @@ class TestRouterArgs:
         assert router_args.health_check_timeout_secs == 3
         assert router_args.health_check_interval_secs == 30
         assert router_args.health_check_endpoint == "/healthz"
+
     def test_from_cli_args_pd_mode(self):
         """Test creating RouterArgs from CLI arguments in PD mode."""
         args = SimpleNamespace(

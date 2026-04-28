@@ -88,6 +88,7 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+
     @staticmethod
     def add_cli_args(
         parser: argparse.ArgumentParser,
@@ -467,6 +468,7 @@ class RouterArgs:
             default=[],
             help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
         )
+
     @classmethod
     def from_cli_args(
         cls, args: argparse.Namespace, use_router_prefix: bool = False
