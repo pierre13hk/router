@@ -1,10 +1,7 @@
 //! Factory for creating router instances
 
 use super::{
-    http::{
-        openai_router::OpenAIRouter, pd_router::PDRouter, router::Router,
-        vllm_pd_router::VllmPDRouter,
-    },
+    http::{openai_router::OpenAIRouter, router::Router, vllm_pd_router::VllmPDRouter},
     RouterTrait,
 };
 use crate::config::{PolicyConfig, RoutingMode};
@@ -21,27 +18,6 @@ impl RouterFactory {
         match &ctx.router_config.mode {
             RoutingMode::Regular { worker_urls } => {
                 Self::create_regular_router(worker_urls, ctx).await
-            }
-            RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                prefill_policy,
-                decode_policy,
-            } => {
-                tracing::info!(
-                    "Creating regular PDRouter with prefill_urls: {:?}, decode_urls: {:?}",
-                    prefill_urls,
-                    decode_urls
-                );
-                Self::create_pd_router(
-                    prefill_urls,
-                    decode_urls,
-                    prefill_policy.as_ref(),
-                    decode_policy.as_ref(),
-                    &ctx.router_config.policy,
-                    ctx,
-                )
-                .await
             }
             RoutingMode::VllmPrefillDecode {
                 prefill_urls,
@@ -76,31 +52,6 @@ impl RouterFactory {
     ) -> Result<Box<dyn RouterTrait>, String> {
         // Create regular router with context
         let router = Router::new(worker_urls.to_vec(), ctx).await?;
-
-        Ok(Box::new(router))
-    }
-
-    /// Create a PD router with injected policy
-    pub async fn create_pd_router(
-        prefill_urls: &[(String, Option<u16>)],
-        decode_urls: &[String],
-        prefill_policy_config: Option<&PolicyConfig>,
-        decode_policy_config: Option<&PolicyConfig>,
-        main_policy_config: &PolicyConfig,
-        ctx: &Arc<AppContext>,
-    ) -> Result<Box<dyn RouterTrait>, String> {
-        // Initialize policies in PolicyRegistry - use specific policies if provided, otherwise fall back to main policy
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
-
-        // Set the prefill and decode policies in the registry
-        ctx.policy_registry.set_prefill_policy(prefill_policy);
-        ctx.policy_registry.set_decode_policy(decode_policy);
-
-        // Create PD router with context (policies are in PolicyRegistry)
-        let router = PDRouter::new(prefill_urls.to_vec(), decode_urls.to_vec(), ctx).await?;
 
         Ok(Box::new(router))
     }

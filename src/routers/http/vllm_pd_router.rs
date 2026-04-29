@@ -1,8 +1,8 @@
 // vLLM PD (Prefill-Decode) Router Implementation
-// This module extends PDRouter to handle vLLM-specific two-stage processing
+// This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
 use super::logprobs_merge;
-use super::pd_router::PDRouter;
+use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
@@ -33,11 +33,11 @@ struct MooncakePrefillInfo {
     dp_engine_ids: HashMap<usize, String>,
 }
 
-/// vLLM PD Router that extends PDRouter with vLLM-specific request handling
+/// vLLM PD Router that extends PdRouterBase with vLLM-specific request handling
 #[derive(Debug)]
 pub struct VllmPDRouter {
     /// Underlying PD router for most functionality
-    pd_router: PDRouter,
+    pd_router: PdRouterBase,
     /// Service discovery registry for dynamic ZMQ address resolution
     service_registry: Arc<ServiceRegistry>,
     /// HTTP client for making requests to discovered services
@@ -959,7 +959,7 @@ impl VllmPDRouter {
         );
 
         // Use endpoint_url() to get the base URL without @rank suffix,
-        // avoiding IPv6+DP URL corruption (same fix as Router and PDRouter)
+        // avoiding IPv6+DP URL corruption (same fix as Router and PdRouterBase)
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
         let prefill_url = prefill_worker.endpoint_url(path);
@@ -1140,7 +1140,7 @@ impl VllmPDRouter {
         }
 
         // Use endpoint_url() to get the base URL without @rank suffix,
-        // avoiding IPv6+DP URL corruption (same fix as Router and PDRouter)
+        // avoiding IPv6+DP URL corruption (same fix as Router and PdRouterBase)
         let decode_base_url = decode_worker.base_url().to_string();
         let decode_dp_rank = decode_worker.dp_rank();
         let decode_url = decode_worker.endpoint_url(path);
@@ -1337,7 +1337,7 @@ impl VllmPDRouter {
             );
 
             // Create underlying PD router with empty worker lists (they'll be discovered dynamically)
-            let pd_router = PDRouter::new(vec![], vec![], ctx).await?;
+            let pd_router = PdRouterBase::new(vec![], vec![], ctx).await?;
 
             // Initialize service discovery
             let mut service_registry = ServiceRegistry::new();
@@ -1367,7 +1367,7 @@ impl VllmPDRouter {
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
             })
         } else {
-            // Direct URL mode (same as PDRouter)
+            // Direct URL mode (same as PdRouterBase)
             info!(
                 "VllmPDRouter::new called in direct URL mode with {} prefill, {} decode workers",
                 prefill_urls.len(),
@@ -1375,7 +1375,7 @@ impl VllmPDRouter {
             );
 
             // Create underlying PD router with provided worker lists
-            let pd_router = PDRouter::new(prefill_urls.clone(), decode_urls, ctx).await?;
+            let pd_router = PdRouterBase::new(prefill_urls.clone(), decode_urls, ctx).await?;
 
             // No service discovery in direct URL mode
             let service_registry = ServiceRegistry::new();
@@ -1458,7 +1458,7 @@ impl VllmPDRouter {
     }
 
     /// Add a prefill server to the router
-    /// Delegates to the underlying PDRouter
+    /// Delegates to the underlying PdRouterBase
     pub async fn add_prefill_server(
         &self,
         url: String,
@@ -1468,31 +1468,31 @@ impl VllmPDRouter {
     }
 
     /// Add a decode server to the router
-    /// Delegates to the underlying PDRouter
+    /// Delegates to the underlying PdRouterBase
     pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {
         self.pd_router.add_decode_server(url).await
     }
 
     /// Remove a prefill server from the router
-    /// Delegates to the underlying PDRouter
+    /// Delegates to the underlying PdRouterBase
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
         self.pd_router.remove_prefill_server(url).await
     }
 
     /// Remove a decode server from the router
-    /// Delegates to the underlying PDRouter
+    /// Delegates to the underlying PdRouterBase
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
         self.pd_router.remove_decode_server(url).await
     }
 
-    /// Get a reference to the underlying PDRouter's worker registry
+    /// Get a reference to the underlying PdRouterBase's worker registry
     /// This allows access to worker information for refresh operations
     pub fn worker_registry(&self) -> &crate::core::WorkerRegistry {
         &self.pd_router.worker_registry
     }
 }
 
-// Delegate most RouterTrait methods to the underlying PDRouter,
+// Delegate most RouterTrait methods to the underlying PdRouterBase,
 // but override specific ones for vLLM behavior
 #[async_trait]
 impl RouterTrait for VllmPDRouter {
@@ -1524,9 +1524,20 @@ impl RouterTrait for VllmPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::GenerateRequest,
-        model_id: Option<&str>,
+        _model_id: Option<&str>,
     ) -> Response {
-        self.pd_router.route_generate(headers, body, model_id).await
+        let request_json = match serde_json::to_value(body) {
+            Ok(json) => json,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Serialization error: {}", e),
+                )
+                    .into_response()
+            }
+        };
+        self.route_transparent(headers, "/generate", &Method::POST, request_json)
+            .await
     }
 
     // Override OpenAI-compatible routes for vLLM two-stage processing
@@ -1567,7 +1578,7 @@ impl RouterTrait for VllmPDRouter {
             self.process_vllm_request(request_json, "/v1/chat/completions", headers)
                 .await
         } else {
-            // Direct URL mode - implement routing logic here (not delegating to PDRouter)
+            // Direct URL mode - implement routing logic here (not delegating to PdRouterBase)
             info!("Using direct URL mode with VllmPDRouter's own routing logic");
 
             // Convert request to JSON
@@ -1738,7 +1749,7 @@ impl RouterTrait for VllmPDRouter {
             self.process_vllm_request(request_json, "/v1/completions", headers)
                 .await
         } else {
-            // Direct URL mode - implement routing logic here (not delegating to PDRouter)
+            // Direct URL mode - implement routing logic here (not delegating to PdRouterBase)
             info!("Using direct URL mode with VllmPDRouter's own routing logic");
 
             // Convert request to JSON
@@ -1915,9 +1926,20 @@ impl RouterTrait for VllmPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::RerankRequest,
-        model_id: Option<&str>,
+        _model_id: Option<&str>,
     ) -> Response {
-        self.pd_router.route_rerank(headers, body, model_id).await
+        let request_json = match serde_json::to_value(body) {
+            Ok(json) => json,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Serialization error: {}", e),
+                )
+                    .into_response()
+            }
+        };
+        self.route_transparent(headers, "/v1/rerank", &Method::POST, request_json)
+            .await
     }
 
     async fn flush_cache(&self) -> Response {
@@ -2081,7 +2103,7 @@ impl RouterTrait for VllmPDRouter {
     }
 }
 
-// Delegate WorkerManagement to the underlying PDRouter
+// Delegate WorkerManagement to the underlying PdRouterBase
 #[async_trait]
 impl WorkerManagement for VllmPDRouter {
     async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
