@@ -185,10 +185,7 @@ impl VllmPDRouter {
     ///
     /// Returns an error for MoRI-IO when no transfer mode has been registered yet, so that
     /// requests are not silently dispatched in READ mode when no instances have registered.
-    fn build_prefill_kv_transfer_params(
-        &self,
-        transfer_id: Option<&str>,
-    ) -> Result<Value, String> {
+    fn build_prefill_kv_transfer_params(&self, transfer_id: Option<&str>) -> Result<Value, String> {
         match self.kv_connector {
             KvConnector::Mooncake => Ok(json!({
                 "do_remote_decode": true,
