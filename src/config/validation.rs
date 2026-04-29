@@ -763,7 +763,9 @@ mod tests {
         let result = ConfigValidator::validate(&config);
         assert!(result.is_err());
         if let Err(e) = result {
-            assert!(e.to_string().contains("MoRI-IO KV connector requires service discovery"));
+            assert!(e
+                .to_string()
+                .contains("MoRI-IO KV connector requires service discovery"));
         }
     }
 
