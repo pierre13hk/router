@@ -68,10 +68,6 @@ pub struct RouterConfig {
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
     #[serde(default)]
     pub enable_igw: bool,
-    /// Model path for loading tokenizer (can be a HuggingFace model ID or local path)
-    pub model_path: Option<String>,
-    /// Explicit tokenizer path (overrides model_path tokenizer if provided)
-    pub tokenizer_path: Option<String>,
     /// History backend configuration (memory or none, default: memory)
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
@@ -133,8 +129,6 @@ pub enum ConnectionMode {
     #[default]
     #[serde(rename = "http")]
     Http,
-    #[serde(rename = "grpc")]
-    Grpc,
 }
 
 /// Routing mode configuration
@@ -145,19 +139,6 @@ pub enum RoutingMode {
     Regular {
         /// List of worker URLs
         worker_urls: Vec<String>,
-    },
-    #[serde(rename = "prefill_decode")]
-    PrefillDecode {
-        /// Prefill worker URLs with optional bootstrap ports
-        prefill_urls: Vec<(String, Option<u16>)>,
-        /// Decode worker URLs
-        decode_urls: Vec<String>,
-        /// Optional separate policy for prefill workers
-        #[serde(skip_serializing_if = "Option::is_none")]
-        prefill_policy: Option<PolicyConfig>,
-        /// Optional separate policy for decode workers
-        #[serde(skip_serializing_if = "Option::is_none")]
-        decode_policy: Option<PolicyConfig>,
     },
     #[serde(rename = "openai")]
     OpenAI {
@@ -184,10 +165,7 @@ pub enum RoutingMode {
 
 impl RoutingMode {
     pub fn is_pd_mode(&self) -> bool {
-        matches!(
-            self,
-            RoutingMode::PrefillDecode { .. } | RoutingMode::VllmPrefillDecode { .. }
-        )
+        matches!(self, RoutingMode::VllmPrefillDecode { .. })
     }
 
     pub fn is_vllm_pd_mode(&self) -> bool {
@@ -197,11 +175,6 @@ impl RoutingMode {
     pub fn worker_count(&self) -> usize {
         match self {
             RoutingMode::Regular { worker_urls } => worker_urls.len(),
-            RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                ..
-            } => prefill_urls.len() + decode_urls.len(),
             RoutingMode::VllmPrefillDecode {
                 prefill_urls,
                 decode_urls,
@@ -216,9 +189,6 @@ impl RoutingMode {
     /// Falls back to the main policy if no specific prefill policy is set
     pub fn get_prefill_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
         match self {
-            RoutingMode::PrefillDecode { prefill_policy, .. } => {
-                prefill_policy.as_ref().unwrap_or(main_policy)
-            }
             RoutingMode::VllmPrefillDecode { prefill_policy, .. } => {
                 prefill_policy.as_ref().unwrap_or(main_policy)
             }
@@ -230,9 +200,6 @@ impl RoutingMode {
     /// Falls back to the main policy if no specific decode policy is set
     pub fn get_decode_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
         match self {
-            RoutingMode::PrefillDecode { decode_policy, .. } => {
-                decode_policy.as_ref().unwrap_or(main_policy)
-            }
             RoutingMode::VllmPrefillDecode { decode_policy, .. } => {
                 decode_policy.as_ref().unwrap_or(main_policy)
             }
@@ -508,8 +475,6 @@ impl Default for RouterConfig {
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
@@ -537,7 +502,6 @@ impl RouterConfig {
     pub fn mode_type(&self) -> &'static str {
         match self.mode {
             RoutingMode::Regular { .. } => "regular",
-            RoutingMode::PrefillDecode { .. } => "prefill_decode",
             RoutingMode::VllmPrefillDecode { .. } => "vllm_prefill_decode",
             RoutingMode::OpenAI { .. } => "openai",
         }
@@ -663,11 +627,12 @@ mod tests {
         };
         assert!(!regular.is_pd_mode());
 
-        let pd = RoutingMode::PrefillDecode {
+        let pd = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: None,
             decode_policy: None,
+            discovery_address: None,
         };
         assert!(pd.is_pd_mode());
     }
@@ -683,7 +648,7 @@ mod tests {
         };
         assert_eq!(regular.worker_count(), 3);
 
-        let pd = RoutingMode::PrefillDecode {
+        let pd = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![
                 ("http://prefill1".to_string(), Some(8001)),
                 ("http://prefill2".to_string(), None),
@@ -695,6 +660,7 @@ mod tests {
             ],
             prefill_policy: None,
             decode_policy: None,
+            discovery_address: None,
         };
         assert_eq!(pd.worker_count(), 5);
 
@@ -714,15 +680,16 @@ mod tests {
         assert!(json.contains("\"type\":\"regular\""));
         assert!(json.contains("\"worker_urls\""));
 
-        // Test PrefillDecode mode
-        let pd = RoutingMode::PrefillDecode {
+        // Test VllmPrefillDecode mode
+        let pd = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: None,
             decode_policy: None,
+            discovery_address: None,
         };
         let json = serde_json::to_string(&pd).unwrap();
-        assert!(json.contains("\"type\":\"prefill_decode\""));
+        assert!(json.contains("\"type\":\"vllm_prefill_decode\""));
         assert!(json.contains("\"prefill_urls\""));
         assert!(json.contains("\"decode_urls\""));
     }
@@ -913,15 +880,16 @@ mod tests {
         assert_eq!(config.mode_type(), "regular");
 
         let config = RouterConfig {
-            mode: RoutingMode::PrefillDecode {
+            mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![],
                 decode_urls: vec![],
                 prefill_policy: None,
                 decode_policy: None,
+                discovery_address: None,
             },
             ..Default::default()
         };
-        assert_eq!(config.mode_type(), "prefill_decode");
+        assert_eq!(config.mode_type(), "vllm_prefill_decode");
     }
 
     #[test]
@@ -1032,7 +1000,7 @@ mod tests {
     #[test]
     fn test_full_pd_mode_config() {
         let config = RouterConfig {
-            mode: RoutingMode::PrefillDecode {
+            mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![
                     ("http://prefill1:8000".to_string(), Some(8001)),
                     ("http://prefill2:8000".to_string(), None),
@@ -1043,6 +1011,7 @@ mod tests {
                 ],
                 prefill_policy: None,
                 decode_policy: None,
+                discovery_address: None,
             },
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
@@ -1080,8 +1049,6 @@ mod tests {
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
             connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
@@ -1148,8 +1115,6 @@ mod tests {
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
             connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
@@ -1212,8 +1177,6 @@ mod tests {
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
             connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
@@ -1241,7 +1204,7 @@ mod tests {
     #[test]
     fn test_pd_policy_fallback_both_specified() {
         // When both prefill and decode policies are specified, they should be used
-        let pd = RoutingMode::PrefillDecode {
+        let pd = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: Some(PolicyConfig::CacheAware {
@@ -1254,6 +1217,7 @@ mod tests {
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
             }),
+            discovery_address: None,
         };
 
         let main_policy = PolicyConfig::Random;
@@ -1273,7 +1237,7 @@ mod tests {
     #[test]
     fn test_pd_policy_fallback_only_prefill() {
         // When only prefill policy is specified, decode should use main policy
-        let pd = RoutingMode::PrefillDecode {
+        let pd = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: Some(PolicyConfig::CacheAware {
@@ -1284,6 +1248,7 @@ mod tests {
                 max_tree_size: 1000,
             }),
             decode_policy: None,
+            discovery_address: None,
         };
 
         let main_policy = PolicyConfig::RoundRobin;
@@ -1304,13 +1269,14 @@ mod tests {
     #[test]
     fn test_pd_policy_fallback_only_decode() {
         // When only decode policy is specified, prefill should use main policy
-        let pd = RoutingMode::PrefillDecode {
+        let pd = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: None,
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
             }),
+            discovery_address: None,
         };
 
         let main_policy = PolicyConfig::Random;
@@ -1331,11 +1297,12 @@ mod tests {
     #[test]
     fn test_pd_policy_fallback_none_specified() {
         // When no specific policies are specified, both should use main policy
-        let pd = RoutingMode::PrefillDecode {
+        let pd = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: None,
             decode_policy: None,
+            discovery_address: None,
         };
 
         let main_policy = PolicyConfig::CacheAware {

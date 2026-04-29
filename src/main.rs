@@ -83,22 +83,6 @@ Examples:
   # Regular mode
   vllm-router --worker-urls http://worker1:8000 http://worker2:8000
 
-  # PD disaggregated mode with same policy for both
-  vllm-router --pd-disaggregation \
-    --prefill http://127.0.0.1:30001 9001 \
-    --prefill http://127.0.0.2:30002 9002 \
-    --decode http://127.0.0.3:30003 \
-    --decode http://127.0.0.4:30004 \
-    --policy cache_aware
-
-  # PD mode with different policies for prefill and decode
-  vllm-router --pd-disaggregation \
-    --prefill http://127.0.0.1:30001 9001 \
-    --prefill http://127.0.0.2:30002 \
-    --decode http://127.0.0.3:30003 \
-    --decode http://127.0.0.4:30004 \
-    --prefill-policy cache_aware --decode-policy power_of_two
-
   # vLLM PD mode with pure service discovery (workers register themselves)
   vllm-router --vllm-pd-disaggregation \
     --vllm-discovery-address 0.0.0.0:30001 \
@@ -125,10 +109,6 @@ struct CliArgs {
     /// Load balancing policy to use
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
-
-    /// Enable PD (Prefill-Decode) disaggregated mode
-    #[arg(long, default_value_t = false)]
-    pd_disaggregation: bool,
 
     /// Enable vLLM PD (Prefill-Decode) disaggregated mode with vLLM-specific two-stage processing
     #[arg(long, default_value_t = false)]
@@ -347,15 +327,6 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     enable_igw: bool,
 
-    // Tokenizer configuration
-    /// Model path for loading tokenizer (HuggingFace model ID or local path)
-    #[arg(long)]
-    model_path: Option<String>,
-
-    /// Explicit tokenizer path (overrides model_path tokenizer if provided)
-    #[arg(long)]
-    tokenizer_path: Option<String>,
-
     /// History backend configuration (memory or none)
     #[arg(long, default_value = "memory", value_parser = ["memory", "none"])]
     history_backend: String,
@@ -370,18 +341,6 @@ struct CliArgs {
 }
 
 impl CliArgs {
-    /// Determine connection mode from worker URLs
-    fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
-        // Only consider it gRPC if explicitly specified with grpc:// or grpcs:// scheme
-        for url in worker_urls {
-            if url.starts_with("grpc://") || url.starts_with("grpcs://") {
-                return ConnectionMode::Grpc;
-            }
-        }
-        // Default to HTTP for all other cases (including http://, https://, or no scheme)
-        ConnectionMode::Http
-    }
-
     /// Parse selector strings into HashMap
     fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
         let mut map = HashMap::new();
@@ -423,14 +382,6 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
-        // Validate mutually exclusive modes
-        if self.pd_disaggregation && self.vllm_pd_disaggregation {
-            return Err(ConfigError::ValidationFailed {
-                reason: "Cannot enable both --pd-disaggregation and --vllm-pd-disaggregation"
-                    .to_string(),
-            });
-        }
-
         // Determine routing mode
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
@@ -441,22 +392,6 @@ impl CliArgs {
             // OpenAI backend mode - use worker_urls as base(s)
             RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
-            }
-        } else if self.pd_disaggregation {
-            let decode_urls = self.decode.clone();
-
-            // Validate PD configuration if not using service discovery
-            if !self.service_discovery && (prefill_urls.is_empty() || decode_urls.is_empty()) {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "PD disaggregation mode requires --prefill and --decode URLs when not using service discovery".to_string(),
-                });
-            }
-
-            RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }
         } else if self.vllm_pd_disaggregation {
             // Use decode URLs from CLI arguments (already parsed by clap)
@@ -550,40 +485,7 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
-        // Determine connection mode from all worker URLs
-        let mut all_urls = Vec::new();
-        match &mode {
-            RoutingMode::Regular { worker_urls } => {
-                all_urls.extend(worker_urls.clone());
-            }
-            RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                ..
-            } => {
-                for (url, _) in prefill_urls {
-                    all_urls.push(url.clone());
-                }
-                all_urls.extend(decode_urls.clone());
-            }
-            RoutingMode::VllmPrefillDecode {
-                prefill_urls,
-                decode_urls,
-                ..
-            } => {
-                for (url, _) in prefill_urls {
-                    all_urls.push(url.clone());
-                }
-                all_urls.extend(decode_urls.clone());
-            }
-            RoutingMode::OpenAI { .. } => {
-                // For connection-mode detection, skip URLs; OpenAI forces HTTP below.
-            }
-        }
-        let connection_mode = match &mode {
-            RoutingMode::OpenAI { .. } => ConnectionMode::Http,
-            _ => Self::determine_connection_mode(&all_urls),
-        };
+        let connection_mode = ConnectionMode::Http;
 
         let api_key_validation_urls = if !self.api_key_validation_urls.is_empty() {
             self.api_key_validation_urls.clone()
@@ -648,8 +550,6 @@ impl CliArgs {
             },
             enable_igw: self.enable_igw,
             rate_limit_tokens_per_second: None,
-            model_path: self.model_path.clone(),
-            tokenizer_path: self.tokenizer_path.clone(),
             history_backend: match self.history_backend.as_str() {
                 "none" => HistoryBackend::None,
                 _ => HistoryBackend::Memory,
@@ -670,8 +570,8 @@ impl CliArgs {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
-                // Enable PD mode for both --pd-disaggregation and --vllm-pd-disaggregation
-                pd_mode: self.pd_disaggregation || self.vllm_pd_disaggregation,
+                // HTTP service discovery only supports the vLLM PD router.
+                pd_mode: self.vllm_pd_disaggregation,
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "vllm.ai/bootstrap-port".to_string(),
@@ -757,7 +657,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("DEBUG: Filtered args: {:?}", filtered_args);
     let cli_args = CliArgs::parse_from(filtered_args);
     println!("DEBUG: CLI args parsed successfully");
-    println!("DEBUG: pd_disaggregation: {}", cli_args.pd_disaggregation);
     println!(
         "DEBUG: vllm_pd_disaggregation: {}",
         cli_args.vllm_pd_disaggregation
@@ -772,8 +671,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "OpenAI Backend".to_string()
     } else if cli_args.vllm_pd_disaggregation {
         "vLLM PD Disaggregated".to_string()
-    } else if cli_args.pd_disaggregation {
-        "PD Disaggregated".to_string()
     } else {
         format!("Regular ({})", cli_args.backend)
     };
@@ -794,7 +691,7 @@ Provide --worker-urls or PD flags as usual.",
     if !cli_args.enable_igw {
         println!("Policy: {}", cli_args.policy);
 
-        if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
+        if cli_args.vllm_pd_disaggregation && !prefill_urls.is_empty() {
             println!("Prefill nodes: {:?}", prefill_urls);
             println!("Decode nodes: {:?}", cli_args.decode);
         }

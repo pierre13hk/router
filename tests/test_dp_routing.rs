@@ -7,7 +7,7 @@
 //!   4. Correctly expands N workers × M ranks into N*M DP-aware workers
 //!
 //! Background: Commit d13949d introduced a regression where hostname:port@rank URLs
-//! were parsed as HTTP userinfo (user:pass@host), because PDRouter and Router created
+//! were parsed as HTTP userinfo (user:pass@host), because PD and regular routers created
 //! BasicWorker instances instead of DPAwareWorker when intra_node_data_parallel_size > 1.
 //! The @rank suffix in BasicWorker::endpoint_url() caused reqwest to interpret
 //! http://node1:8087@1/v1/completions as username=node1, password=8087, host=1.
@@ -75,7 +75,7 @@ mod dp_routing_tests {
     // =====================================================================
     // Test 2: parse_worker_url round-trip with DPAwareWorker
     // =====================================================================
-    // Verifies the pattern used in PDRouter::new() and Router initialization:
+    // Verifies the pattern used in PD and regular router initialization:
     // expand URL → parse back → create DPAwareWorker
 
     #[test]
@@ -275,8 +275,6 @@ mod dp_e2e_tests {
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
@@ -291,11 +289,12 @@ mod dp_e2e_tests {
         dp_size: usize,
     ) -> RouterConfig {
         RouterConfig {
-            mode: RoutingMode::PrefillDecode {
+            mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls,
                 decode_urls,
                 prefill_policy: None,
                 decode_policy: None,
+                discovery_address: None,
             },
             policy: PolicyConfig::RoundRobin,
             host: "127.0.0.1".to_string(),
@@ -324,8 +323,6 @@ mod dp_e2e_tests {
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
@@ -571,11 +568,11 @@ mod dp_e2e_tests {
     }
 
     // -----------------------------------------------------------------
-    // PD Router + DP > 1: worker registry verification
+    // vLLM PD Router + DP > 1: worker registry verification
     // -----------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_pd_router_dp2_creates_dp_aware_workers() {
+    async fn test_vllm_pd_router_dp2_creates_dp_aware_workers() {
         let mut prefill_worker = MockWorker::new(MockWorkerConfig {
             port: 0,
             worker_type: WorkerType::Prefill,
@@ -639,14 +636,14 @@ mod dp_e2e_tests {
     }
 
     // -----------------------------------------------------------------
-    // PD Router + DP > 1: add_prefill_server / add_decode_server runtime path
+    // vLLM PD Router + DP > 1: add_prefill_server / add_decode_server runtime path
     // -----------------------------------------------------------------
     // These tests verify the fix for D100422851: when dp_size > 1,
     // add_prefill_server/add_decode_server must create DPAwareWorker
     // (not BasicWorker) to prevent IPv6+DP URL corruption.
 
     #[tokio::test]
-    async fn test_pd_router_add_prefill_server_dp2_creates_dp_aware_worker() {
+    async fn test_vllm_pd_router_add_prefill_server_dp2_creates_dp_aware_worker() {
         // Start initial PD workers for router creation
         let mut initial_prefill = MockWorker::new(MockWorkerConfig {
             port: 0,
@@ -675,7 +672,7 @@ mod dp_e2e_tests {
         });
         let new_prefill_url = new_prefill.start().await.unwrap();
 
-        // Create PDRouter with dp_size=2
+        // Create vLLM PD router with dp_size=2
         let config = make_pd_config(
             vec![(prefill_url.clone(), None)],
             vec![decode_url.clone()],
@@ -689,10 +686,9 @@ mod dp_e2e_tests {
         // Initial workers: 1 prefill × 2 + 1 decode × 2 = 4
         assert_eq!(app_context.worker_registry.get_all().len(), 4);
 
-        // Downcast to PDRouter and add a new prefill server at runtime
-        use vllm_router_rs::routers::http::pd_router::PDRouter;
-        let pd_router = router.as_any().downcast_ref::<PDRouter>().unwrap();
-        assert_eq!(pd_router.dp_size, 2, "PDRouter should have dp_size=2");
+        // Downcast to the user-facing vLLM PD router and add a new prefill server at runtime.
+        use vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter;
+        let pd_router = router.as_any().downcast_ref::<VllmPDRouter>().unwrap();
 
         // Add new prefill server (plain URL, no @rank — mimics service discovery)
         let result = pd_router
@@ -705,8 +701,8 @@ mod dp_e2e_tests {
         );
 
         // The new worker should be registered as DPAwareWorker
-        // With dp_size=2 and no @rank in URL, parse_worker_url returns rank=None,
-        // so DPAwareWorker gets rank 0 → url = "new_prefill_url@0"
+        // With dp_size=2 and no @rank in URL, the router expands the bare URL
+        // into one DPAwareWorker per rank.
         let new_worker_url = format!("{}@0", new_prefill_url);
         let worker = app_context.worker_registry.get_by_url(&new_worker_url);
         assert!(
@@ -742,7 +738,7 @@ mod dp_e2e_tests {
     }
 
     #[tokio::test]
-    async fn test_pd_router_add_decode_server_dp2_creates_dp_aware_worker() {
+    async fn test_vllm_pd_router_add_decode_server_dp2_creates_dp_aware_worker() {
         let mut initial_prefill = MockWorker::new(MockWorkerConfig {
             port: 0,
             worker_type: WorkerType::Prefill,
@@ -780,8 +776,8 @@ mod dp_e2e_tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        use vllm_router_rs::routers::http::pd_router::PDRouter;
-        let pd_router = router.as_any().downcast_ref::<PDRouter>().unwrap();
+        use vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter;
+        let pd_router = router.as_any().downcast_ref::<VllmPDRouter>().unwrap();
 
         // Add new decode server at runtime
         let result = pd_router.add_decode_server(new_decode_url.clone()).await;
@@ -816,7 +812,7 @@ mod dp_e2e_tests {
     }
 
     #[tokio::test]
-    async fn test_pd_router_add_prefill_server_dp1_creates_basic_worker() {
+    async fn test_vllm_pd_router_add_prefill_server_dp1_creates_basic_worker() {
         // With dp_size=1, add_prefill_server should create BasicWorker
         let mut initial_prefill = MockWorker::new(MockWorkerConfig {
             port: 0,
@@ -854,9 +850,8 @@ mod dp_e2e_tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        use vllm_router_rs::routers::http::pd_router::PDRouter;
-        let pd_router = router.as_any().downcast_ref::<PDRouter>().unwrap();
-        assert_eq!(pd_router.dp_size, 1);
+        use vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter;
+        let pd_router = router.as_any().downcast_ref::<VllmPDRouter>().unwrap();
 
         let result = pd_router
             .add_prefill_server(new_prefill_url.clone(), None)
@@ -883,7 +878,7 @@ mod dp_e2e_tests {
     }
 
     #[tokio::test]
-    async fn test_pd_router_dp1_creates_basic_workers() {
+    async fn test_vllm_pd_router_dp1_creates_basic_workers() {
         let mut prefill_worker = MockWorker::new(MockWorkerConfig {
             port: 0,
             worker_type: WorkerType::Prefill,
