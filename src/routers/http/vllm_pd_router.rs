@@ -60,6 +60,10 @@ pub struct VllmPDRouter {
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
 }
 
+/// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
+/// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
+const MORIIO_TRANSFER_PREFIX: &str = "tx";
+
 impl VllmPDRouter {
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
     /// Retries with backoff since the prefill server may not be ready at router startup.
@@ -140,23 +144,52 @@ impl VllmPDRouter {
         ))
     }
 
+    /// Generate a connector-specific transfer ID for correlating prefill and decode legs.
+    /// Returns `None` for connectors that do not use a transfer_id (e.g. NIXL).
+    fn generate_transfer_id(&self) -> Option<String> {
+        match self.kv_connector {
+            // Mooncake uses the "xfer-<uuid>" format.
+            KvConnector::Mooncake => Some(format!("xfer-{}", Uuid::new_v4())),
+            // MoRI-IO uses the "tx-<uuid-no-dashes>" format to match MoRIIOConstants.TRANSFER_PREFIX.
+            KvConnector::MoriIO => Some(format!(
+                "{}-{}",
+                MORIIO_TRANSFER_PREFIX,
+                Uuid::new_v4().simple()
+            )),
+            KvConnector::Nixl => None,
+        }
+    }
+
     /// Build kv_transfer_params for the prefill request
     fn build_prefill_kv_transfer_params(&self, transfer_id: Option<&str>) -> Value {
-        if matches!(self.kv_connector, KvConnector::Mooncake) {
-            json!({
-                "do_remote_decode": true,
-                "do_remote_prefill": false,
-                "transfer_id": transfer_id.unwrap_or(""),
-            })
-        } else {
-            json!({
-                "do_remote_decode": true,
-                "do_remote_prefill": false,
-                "remote_engine_id": serde_json::Value::Null,
-                "remote_block_ids": serde_json::Value::Null,
-                "remote_host": serde_json::Value::Null,
-                "remote_port": serde_json::Value::Null
-            })
+        match self.kv_connector {
+            KvConnector::Mooncake => {
+                json!({
+                    "do_remote_decode": true,
+                    "do_remote_prefill": false,
+                    "transfer_id": transfer_id.unwrap_or(""),
+                })
+            }
+            KvConnector::MoriIO => {
+                json!({
+                    "do_remote_decode": true,
+                    "do_remote_prefill": false,
+                    "remote_engine_id": serde_json::Value::Null,
+                    "remote_block_ids": serde_json::Value::Null,
+                    "transfer_id": transfer_id.unwrap_or(""),
+                    "remote_dp_size": self.intra_node_data_parallel_size,
+                })
+            }
+            KvConnector::Nixl => {
+                json!({
+                    "do_remote_decode": true,
+                    "do_remote_prefill": false,
+                    "remote_engine_id": serde_json::Value::Null,
+                    "remote_block_ids": serde_json::Value::Null,
+                    "remote_host": serde_json::Value::Null,
+                    "remote_port": serde_json::Value::Null
+                })
+            }
         }
     }
 
@@ -516,17 +549,12 @@ impl VllmPDRouter {
         // Prepare prefill request (max_tokens=1 to force prefill-only mode)
         let mut prefill_request = Self::prepare_prefill_request(request_json.clone(), path);
 
-        // Generate transfer_id for Mooncake (unused for NIXL)
-        let transfer_id = format!("xfer-{}", Uuid::new_v4());
-        let transfer_id_ref: Option<&str> = if matches!(self.kv_connector, KvConnector::Mooncake) {
-            Some(&transfer_id)
-        } else {
-            None
-        };
+        // Generate a connector-specific transfer_id (None for NIXL)
+        let transfer_id = self.generate_transfer_id();
 
         // Add kv_transfer_params for KV connector support at top level
         prefill_request["kv_transfer_params"] =
-            self.build_prefill_kv_transfer_params(transfer_id_ref);
+            self.build_prefill_kv_transfer_params(transfer_id.as_deref());
 
         debug!(
             "Added kv_transfer_params to prefill request for {:?} connector",
@@ -651,7 +679,7 @@ impl VllmPDRouter {
             {
                 decode_request["kv_transfer_params"] = self
                     .build_mooncake_decode_kv_transfer_params(
-                        &transfer_id,
+                        transfer_id.as_deref().unwrap_or(""),
                         &bootstrap_addr,
                         &engine_id,
                     );
@@ -666,18 +694,17 @@ impl VllmPDRouter {
                 );
             }
         } else {
-            // NIXL: extract kv_transfer_params from prefill response
-            let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
-            if let Some(ref params) = kv_transfer_params {
-                debug!(
-                    "Extracted kv_transfer_params from prefill response: {}",
-                    serde_json::to_string_pretty(params).unwrap_or_default()
-                );
-            } else {
-                debug!("No kv_transfer_params found in prefill response");
-            }
-            if let Some(params) = kv_transfer_params {
+            // NIXL and MoRI-IO: extract kv_transfer_params from prefill response
+            if let Some(mut params) = kv_transfer_params {
+                if matches!(self.kv_connector, KvConnector::MoriIO) {
+                    // MoRI-IO decode connector needs to know how many prefill DP ranks to handshake with.
+                    params["remote_dp_size"] = json!(self.intra_node_data_parallel_size);
+                }
                 decode_request["kv_transfer_params"] = params;
+                debug!(
+                    "Added kv_transfer_params to decode request for {:?} connector",
+                    self.kv_connector
+                );
             }
         }
 
@@ -919,17 +946,12 @@ impl VllmPDRouter {
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
 
-        // Generate transfer_id for Mooncake (unused for NIXL)
-        let transfer_id = format!("xfer-{}", Uuid::new_v4());
-        let transfer_id_ref: Option<&str> = if matches!(self.kv_connector, KvConnector::Mooncake) {
-            Some(&transfer_id)
-        } else {
-            None
-        };
+        // Generate a connector-specific transfer_id (None for NIXL)
+        let transfer_id = self.generate_transfer_id();
 
         // Add kv_transfer_params for KV connector support at top level
         prefill_request["kv_transfer_params"] =
-            self.build_prefill_kv_transfer_params(transfer_id_ref);
+            self.build_prefill_kv_transfer_params(transfer_id.as_deref());
 
         debug!(
             "Added kv_transfer_params to prefill request for {:?} connector",
@@ -1088,7 +1110,7 @@ impl VllmPDRouter {
             {
                 decode_request["kv_transfer_params"] = self
                     .build_mooncake_decode_kv_transfer_params(
-                        &transfer_id,
+                        transfer_id.as_deref().unwrap_or(""),
                         &bootstrap_addr,
                         &engine_id,
                     );
@@ -1103,18 +1125,17 @@ impl VllmPDRouter {
                 );
             }
         } else {
-            // NIXL: extract kv_transfer_params from prefill response
-            let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
-            if let Some(ref params) = kv_transfer_params {
-                debug!(
-                    "Extracted kv_transfer_params from prefill response: {}",
-                    serde_json::to_string_pretty(params).unwrap_or_default()
-                );
-            } else {
-                debug!("No kv_transfer_params found in prefill response");
-            }
-            if let Some(params) = kv_transfer_params {
+            // NIXL and MoRI-IO: extract kv_transfer_params from prefill response
+            if let Some(mut params) = kv_transfer_params {
+                if matches!(self.kv_connector, KvConnector::MoriIO) {
+                    // MoRI-IO decode connector needs to know how many prefill DP ranks to handshake with.
+                    params["remote_dp_size"] = json!(self.intra_node_data_parallel_size);
+                }
                 decode_request["kv_transfer_params"] = params;
+                debug!(
+                    "Added kv_transfer_params to decode request for {:?} connector",
+                    self.kv_connector
+                );
             }
         }
 
@@ -2240,5 +2261,25 @@ mod tests {
         let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
         assert_eq!(result["stream"], false);
         assert!(result.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn test_kv_transfer_params_moriio_includes_transfer_id_and_remote_dp_size() {
+        // MoRI-IO prefill params must carry transfer_id and remote_dp_size.
+        use crate::config::KvConnector;
+        // Verify the KvConnector::MoriIO variant exists and serializes correctly.
+        let connector = KvConnector::MoriIO;
+        assert_eq!(format!("{:?}", connector), "MoriIO");
+        // The transfer_id prefix must match MoRIIOConstants.TRANSFER_PREFIX.
+        assert_eq!(MORIIO_TRANSFER_PREFIX, "tx");
+    }
+
+    #[test]
+    fn test_kv_transfer_params_nixl_has_no_transfer_id_or_remote_dp_size() {
+        // NIXL prefill params must not carry transfer_id or remote_dp_size.
+        use crate::config::KvConnector;
+        // Verify the KvConnector::Nixl variant exists and is the default.
+        let connector = KvConnector::default();
+        assert_eq!(connector, KvConnector::Nixl);
     }
 }

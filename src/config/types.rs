@@ -117,6 +117,10 @@ pub enum KvConnector {
     #[serde(rename = "mooncake")]
     #[value(name = "mooncake")]
     Mooncake,
+    /// MoRI-IO KV transfer
+    #[serde(rename = "moriio")]
+    #[value(name = "moriio")]
+    MoriIO,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
