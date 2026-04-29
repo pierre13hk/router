@@ -80,6 +80,20 @@ fn extract_base_http_and_dp_rank(
     }
 }
 
+/// Build a prefill reqwest::RequestBuilder with the standard headers and dp-rank header.
+fn build_prefill_request_builder(
+    http_client: &reqwest::Client,
+    url: &str,
+    request_id: &str,
+    dp_rank: Option<usize>,
+) -> reqwest::RequestBuilder {
+    let builder = http_client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("X-Request-Id", request_id);
+    dp_utils::add_dp_rank_header(builder, dp_rank)
+}
+
 impl VllmPDRouter {
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
     /// Retries with backoff since the prefill server may not be ready at router startup.
@@ -788,93 +802,88 @@ impl VllmPDRouter {
         let prefill_request_str = serde_json::to_string(&prefill_request)
             .map_err(|e| format!("Failed to serialize prefill request: {}", e))?;
 
+        let prefill_request_url = format!("http://{}{}", prefill_base_http, path);
+
         // Stage 1: dispatch prefill.
-        // WRITE mode: defer the prefill send until Stage 2 so we can run both concurrently
-        // READ mode: await and parse — decode params come from the prefill response body.
-        //
-        // moriio_write_prefill_str holds the serialized prefill body in WRITE mode so it
-        // can be moved into the join! closure later (prefill_request_str is consumed here).
-        let (moriio_write_prefill_str, prefill_response_json): (Option<String>, Option<Value>) =
-            if is_moriio_write {
-                (Some(prefill_request_str), None)
-            } else {
-                debug!(
+        // READ mode: send now and await — decode kv_transfer_params come from the prefill response.
+        // WRITE mode: skip; prefill is sent concurrently with decode in Stage 2 via tokio::join!.
+        let prefill_response_json: Option<Value> = if is_moriio_write {
+            None
+        } else {
+            debug!(
                 "Stage 1: Sending prefill-only request (max_tokens=1) to prefill server at http://{}",
                 prefill_http
             );
-                self.start_profiling(&format!("http://{}", prefill_base_http))
-                    .await;
+            self.start_profiling(&format!("http://{}", prefill_base_http))
+                .await;
 
-                let mut prefill_request_builder = self
-                    .http_client
-                    .post(format!("http://{}{}", prefill_base_http, path))
-                    .header("Content-Type", "application/json")
-                    .header("X-Request-Id", &request_id);
-                prefill_request_builder =
-                    dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
-
-                let prefill_request_url = format!("http://{}{}", prefill_base_http, path);
-                let prefill_response = match otel_http::send_client_request(
-                    prefill_request_builder.body(prefill_request_str),
-                    headers,
-                    ClientRequestOptions {
-                        method: "POST",
-                        url: &prefill_request_url,
-                        route: Some(path),
-                        request_phase: Some("prefill"),
-                    },
+            let prefill_response = match otel_http::send_client_request(
+                build_prefill_request_builder(
+                    &self.http_client,
+                    &prefill_request_url,
+                    &request_id,
+                    prefill_dp_rank,
                 )
-                .await
-                {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        let full_error = error_chain(&e);
-                        let duration = start_time.elapsed();
-                        RouterMetrics::record_pd_prefill_error(prefill_http);
-                        RouterMetrics::record_pd_request(path);
-                        RouterMetrics::record_pd_request_duration(path, duration);
-                        return Err(format!(
-                            "Prefill request failed to {}: {}",
-                            prefill_http, full_error
-                        ));
-                    }
-                };
-
-                let prefill_status = prefill_response.status();
-                debug!("Prefill server responded with status: {}", prefill_status);
-
-                if !prefill_status.is_success() {
+                .body(prefill_request_str.clone()),
+                headers,
+                ClientRequestOptions {
+                    method: "POST",
+                    url: &prefill_request_url,
+                    route: Some(path),
+                    request_phase: Some("prefill"),
+                },
+            )
+            .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let full_error = error_chain(&e);
                     let duration = start_time.elapsed();
                     RouterMetrics::record_pd_prefill_error(prefill_http);
                     RouterMetrics::record_pd_request(path);
                     RouterMetrics::record_pd_request_duration(path, duration);
-                    let error_body = prefill_response.text().await.unwrap_or_default();
                     return Err(format!(
-                        "Prefill server error {}: {}",
-                        prefill_status, error_body
+                        "Prefill request failed to {}: {}",
+                        prefill_http, full_error
                     ));
                 }
+            };
 
-                // Extract kv_transfer_params from prefill response
-                let prefill_response_text = prefill_response.text().await.map_err(|e| {
-                    let full_error = error_chain(&e);
-                    format!(
-                        "Failed to read prefill response from {}: {}",
-                        prefill_http, full_error
-                    )
-                })?;
+            let prefill_status = prefill_response.status();
+            debug!("Prefill server responded with status: {}", prefill_status);
 
-                debug!("Prefill response body: {}", prefill_response_text);
+            if !prefill_status.is_success() {
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_prefill_error(prefill_http);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
+                let error_body = prefill_response.text().await.unwrap_or_default();
+                return Err(format!(
+                    "Prefill server error {}: {}",
+                    prefill_status, error_body
+                ));
+            }
 
-                let prefill_json: Value = serde_json::from_str(&prefill_response_text)
-                    .map_err(|e| format!("Failed to parse prefill response as JSON: {}", e))?;
+            // Extract kv_transfer_params from prefill response
+            let prefill_response_text = prefill_response.text().await.map_err(|e| {
+                let full_error = error_chain(&e);
+                format!(
+                    "Failed to read prefill response from {}: {}",
+                    prefill_http, full_error
+                )
+            })?;
 
-                // Stop profiling on prefill server once we have its response.
-                self.stop_profiling(&format!("http://{}", prefill_base_http))
-                    .await;
+            debug!("Prefill response body: {}", prefill_response_text);
 
-                (None, Some(prefill_json))
-            }; // end (moriio_write_prefill_str, prefill_response_json)
+            let prefill_json: Value = serde_json::from_str(&prefill_response_text)
+                .map_err(|e| format!("Failed to parse prefill response as JSON: {}", e))?;
+
+            // Stop profiling on prefill server once we have its response.
+            self.stop_profiling(&format!("http://{}", prefill_base_http))
+                .await;
+
+            Some(prefill_json)
+        };
 
         // Prepare decode request
         let mut decode_request = request_json.clone();
@@ -929,24 +938,27 @@ impl VllmPDRouter {
         // WRITE mode: run prefill and decode concurrently via tokio::join! so the prefill
         // task is always guaranteed to execute (unlike fire-and-forget tokio::spawn, which
         // can be silently dropped under load) and both HTTP sends start at the same time.
-        if let Some(write_prefill_str) = moriio_write_prefill_str {
+        if is_moriio_write {
             self.start_profiling(&format!("http://{}", prefill_base_http))
                 .await;
-            let http_client = self.http_client.clone();
-            let prefill_url = format!("http://{}{}", prefill_base_http, path);
-            let prefill_request_id = request_id.clone();
-            let prefill_dp_rank_copy = prefill_dp_rank;
+            // Capture references rather than clones — tokio::join! polls both futures on the
+            // same task so they don't need to be Send, and local borrows are valid for the
+            // duration of the join.
+            let http_client = &self.http_client;
             let enable_profiling = self.enable_profiling;
-            let profiling_tasks = self.profiling_tasks.clone();
-            let pd_router = self.pd_router.clone();
-            let prefill_base_http_clone = prefill_base_http.clone();
+            let profiling_tasks = &self.profiling_tasks;
+            let pd_router = &self.pd_router;
             let prefill_fut = async move {
-                let mut builder = http_client
-                    .post(&prefill_url)
-                    .header("Content-Type", "application/json")
-                    .header("X-Request-Id", &prefill_request_id);
-                builder = dp_utils::add_dp_rank_header(builder, prefill_dp_rank_copy);
-                match builder.body(write_prefill_str).send().await {
+                match build_prefill_request_builder(
+                    http_client,
+                    &prefill_request_url,
+                    &request_id,
+                    prefill_dp_rank,
+                )
+                .body(prefill_request_str)
+                .send()
+                .await
+                {
                     Ok(resp) => debug!(
                         "MoRI-IO WRITE prefill completed with status {}",
                         resp.status()
@@ -954,7 +966,7 @@ impl VllmPDRouter {
                     Err(e) => warn!("MoRI-IO WRITE prefill request failed: {}", e),
                 }
                 if enable_profiling {
-                    let worker_url = format!("http://{}", prefill_base_http_clone);
+                    let worker_url = format!("http://{}", prefill_base_http);
                     let mut tasks = profiling_tasks.lock().await;
                     if let Some(handle) = tasks.remove(&worker_url) {
                         handle.abort();
@@ -1090,8 +1102,9 @@ impl VllmPDRouter {
         let transfer_id = self.generate_transfer_id();
 
         // Add kv_transfer_params for KV connector support at top level
-        prefill_request["kv_transfer_params"] =
-            self.build_prefill_kv_transfer_params(transfer_id.as_deref());
+        prefill_request["kv_transfer_params"] = self
+            .build_prefill_kv_transfer_params(transfer_id.as_deref())
+            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
         debug!(
             "Added kv_transfer_params to prefill request for {:?} connector",
