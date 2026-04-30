@@ -950,7 +950,7 @@ impl VllmPDRouter {
             let profiling_tasks = &self.profiling_tasks;
             let pd_router = &self.pd_router;
             let prefill_fut = async move {
-                match build_prefill_request_builder(
+                let result = build_prefill_request_builder(
                     http_client,
                     &prefill_request_url,
                     &request_id,
@@ -958,14 +958,7 @@ impl VllmPDRouter {
                 )
                 .body(prefill_request_str)
                 .send()
-                .await
-                {
-                    Ok(resp) => debug!(
-                        "MoRI-IO WRITE prefill completed with status {}",
-                        resp.status()
-                    ),
-                    Err(e) => warn!("MoRI-IO WRITE prefill request failed: {}", e),
-                }
+                .await;
                 if enable_profiling {
                     let worker_url = format!("http://{}", prefill_base_http);
                     let mut tasks = profiling_tasks.lock().await;
@@ -973,6 +966,24 @@ impl VllmPDRouter {
                         handle.abort();
                     }
                     pd_router.stop_profiling(&worker_url).await;
+                }
+                match result {
+                    Ok(resp) if resp.status().is_success() => {
+                        debug!(
+                            "MoRI-IO WRITE prefill completed with status {}",
+                            resp.status()
+                        );
+                        Ok(())
+                    }
+                    Ok(resp) => {
+                        let status = resp.status();
+                        warn!("MoRI-IO WRITE prefill returned non-2xx status: {}", status);
+                        Err(format!("Prefill request failed with status {}", status))
+                    }
+                    Err(e) => {
+                        warn!("MoRI-IO WRITE prefill request failed: {}", e);
+                        Err(format!("Prefill request failed: {}", e))
+                    }
                 }
             };
             let decode_fut = otel_http::send_client_request(
@@ -985,7 +996,17 @@ impl VllmPDRouter {
                     request_phase: Some("decode"),
                 },
             );
-            let (_, decode_result) = tokio::join!(prefill_fut, decode_fut);
+            let (prefill_result, decode_result) = tokio::join!(prefill_fut, decode_fut);
+            if let Err(prefill_err) = prefill_result {
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
+                RouterMetrics::record_pd_prefill_request(prefill_http);
+                return Err(format!(
+                    "Prefill request failed to {}: {}",
+                    prefill_http, prefill_err
+                ));
+            }
             let decode_response = match decode_result {
                 Ok(resp) => resp,
                 Err(e) => {
