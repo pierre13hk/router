@@ -81,14 +81,16 @@ pub struct ServiceRegistry {
 }
 
 /// Deserialize a registration message according to the active KV connector.
-/// Returns the base `ServiceRegistration` on success, or `None` if the message
-/// should be dropped (parse error, unknown mode, or transfer-mode mismatch).
+/// Returns the parsed `ServiceRegistration` and, for MoRI-IO, the validated transfer mode.
+/// Returns `None` if the message should be dropped (parse error, unknown mode, or
+/// transfer-mode mismatch). The caller is responsible for committing the transfer mode
+/// to the `OnceLock` only after the service type has been validated.
 fn parse_registration(
     message_data: &[u8],
     remote_address: &[u8],
     kv_connector: KvConnector,
     moriio_transfer_mode: &Arc<OnceLock<MoriIOTransferMode>>,
-) -> Option<ServiceRegistration> {
+) -> Option<(ServiceRegistration, Option<MoriIOTransferMode>)> {
     if matches!(kv_connector, KvConnector::MoriIO) {
         let reg: MoriIOServiceRegistration = match rmp_serde::from_slice(message_data) {
             Ok(r) => r,
@@ -108,8 +110,8 @@ fn parse_registration(
                 return None;
             }
         };
-        if moriio_transfer_mode.set(mode).is_err() {
-            let stored = moriio_transfer_mode.get().copied().unwrap();
+        // Check for mismatch against already-committed mode without committing yet.
+        if let Some(&stored) = moriio_transfer_mode.get() {
             if stored != mode {
                 warn!(
                     "MoRI-IO transfer_mode mismatch: expected {:?}, got {:?} from {}; skipping",
@@ -119,13 +121,11 @@ fn parse_registration(
                 );
                 return None;
             }
-        } else {
-            info!("MoRI-IO transfer mode set to {:?}", mode);
         }
-        Some(reg.base)
+        Some((reg.base, Some(mode)))
     } else {
         match rmp_serde::from_slice(message_data) {
-            Ok(data) => Some(data),
+            Ok(data) => Some((data, None)),
             Err(e) => {
                 warn!("Failed to parse service registration: {}", e);
                 None
@@ -237,7 +237,7 @@ impl ServiceRegistry {
         kv_connector: KvConnector,
         moriio_transfer_mode: &Arc<OnceLock<MoriIOTransferMode>>,
     ) {
-        let data = match parse_registration(
+        let (data, parsed_mode) = match parse_registration(
             message_data,
             remote_address,
             kv_connector,
@@ -258,6 +258,18 @@ impl ServiceRegistry {
         };
 
         let remote_addr_str = String::from_utf8_lossy(remote_address);
+
+        match data.service_type.as_str() {
+            "P" | "D" => {
+                // Commit transfer mode only after service type is confirmed valid.
+                if let Some(mode) = parsed_mode {
+                    if moriio_transfer_mode.set(mode).is_ok() {
+                        info!("MoRI-IO transfer mode set to {:?}", mode);
+                    }
+                }
+            }
+            _ => {}
+        }
 
         match data.service_type.as_str() {
             "P" => {
