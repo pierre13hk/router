@@ -1,5 +1,5 @@
 use crate::{
-    config::{ConnectionMode, HistoryBackend, RouterConfig, TraceConfig},
+    config::{HistoryBackend, RouterConfig, TraceConfig},
     core::{WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
@@ -18,7 +18,6 @@ use crate::{
         RouterFactory, RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
-    tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
 };
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, Request, State},
@@ -44,7 +43,6 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
-    pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
@@ -64,28 +62,6 @@ impl AppContext {
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
-        // Initialize gRPC-specific components only when in gRPC mode
-        let tokenizer = if router_config.connection_mode == ConnectionMode::Grpc {
-            // Get tokenizer path (required for gRPC mode)
-            let tokenizer_path = router_config
-                .tokenizer_path
-                .clone()
-                .or_else(|| router_config.model_path.clone())
-                .ok_or_else(|| {
-                    "gRPC mode requires either --tokenizer-path or --model-path to be specified"
-                        .to_string()
-                })?;
-
-            // Initialize tokenizer
-            Some(
-                tokenizer_factory::create_tokenizer(&tokenizer_path)
-                    .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
-            )
-        } else {
-            // HTTP mode doesn't need tokenizer
-            None
-        };
-
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
 
@@ -101,7 +77,6 @@ impl AppContext {
             client,
             router_config,
             rate_limiter,
-            tokenizer,
             worker_registry,
             policy_registry,
             router_manager,
@@ -854,11 +829,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     println!("DEBUG: Prometheus metrics initialized");
 
     info!(
-        "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
+        "Starting router on {}:{} | mode: {:?} | policy: {:?} | kv_connector: {:?} | max_payload: {}MB",
         config.host,
         config.port,
         config.router_config.mode,
         config.router_config.policy,
+        config.router_config.kv_connector,
         config.max_payload_size / (1024 * 1024)
     );
 
@@ -919,10 +895,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 }
             }
 
-            // 2. HTTP PD Router
-            match RouterFactory::create_pd_router(
+            // 2. HTTP vLLM PD Router
+            match RouterFactory::create_vllm_pd_router(
                 &[],
                 &[],
+                None,
                 None,
                 None,
                 &config.router_config.policy,
@@ -931,16 +908,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             {
                 Ok(http_pd) => {
-                    info!("Created HTTP PD router");
+                    info!("Created HTTP vLLM PD router");
                     router_manager
                         .register_router(RouterId::new("http-pd".to_string()), Arc::from(http_pd));
                 }
                 Err(e) => {
-                    warn!("Failed to create HTTP PD router: {e}");
+                    warn!("Failed to create HTTP vLLM PD router: {e}");
                 }
             }
-
-            // TODO: Add gRPC routers once we have dynamic tokenizer loading
 
             info!(
                 "RouterManager initialized with {} routers",

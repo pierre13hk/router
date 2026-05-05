@@ -15,7 +15,6 @@ class RouterArgs:
 
     # PD-specific configuration
     mini_lb: bool = False
-    pd_disaggregation: bool = False  # Enable PD disaggregated mode
     vllm_pd_disaggregation: bool = False  # Enable vLLM PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
@@ -50,6 +49,8 @@ class RouterArgs:
     prefill_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     decode_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     bootstrap_port_annotation: str = "vllm.ai/bootstrap-port"
+    # KV connector for PD disaggregation (nixl pull-based or mooncake push-based)
+    kv_connector: str = "nixl"
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
@@ -86,9 +87,6 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
-    # Tokenizer configuration
-    model_path: Optional[str] = None
-    tokenizer_path: Optional[str] = None
 
     @staticmethod
     def add_cli_args(
@@ -175,11 +173,6 @@ class RouterArgs:
             f"--{prefix}mini-lb",
             action="store_true",
             help="Enable MiniLB",
-        )
-        parser.add_argument(
-            f"--{prefix}pd-disaggregation",
-            action="store_true",
-            help="Enable PD (Prefill-Decode) disaggregated mode",
         )
         parser.add_argument(
             f"--{prefix}vllm-pd-disaggregation",
@@ -315,6 +308,15 @@ class RouterArgs:
             nargs="+",
             default={},
             help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-connector",
+            type=str,
+            default=RouterArgs.kv_connector,
+            choices=["nixl", "mooncake"],
+            help="KV connector type for PD disaggregation. 'nixl' (default) uses NIXL's "
+            "pull-based KV transfer; 'mooncake' uses Mooncake's push-based protocol "
+            "(queries each prefill node's bootstrap server for engine_id per DP rank).",
         )
         # Prometheus configuration
         parser.add_argument(
@@ -460,19 +462,6 @@ class RouterArgs:
             default=[],
             help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
         )
-        # Tokenizer configuration
-        parser.add_argument(
-            f"--{prefix}model-path",
-            type=str,
-            default=None,
-            help="Model path for loading tokenizer (HuggingFace model ID or local path)",
-        )
-        parser.add_argument(
-            f"--{prefix}tokenizer-path",
-            type=str,
-            default=None,
-            help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
-        )
 
     @classmethod
     def from_cli_args(
@@ -520,7 +509,7 @@ class RouterArgs:
 
     def _validate_router_args(self):
         # Validate configuration based on mode
-        if self.pd_disaggregation or self.vllm_pd_disaggregation:
+        if self.vllm_pd_disaggregation:
             # Validate PD configuration - skip URL requirements if using service discovery
             if not self.service_discovery:
                 if not self.prefill_urls:

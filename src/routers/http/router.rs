@@ -598,7 +598,7 @@ impl Router {
                     .await;
 
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
-                // should count against the circuit breaker. This matches pd_router.rs behavior.
+                // should count against the circuit breaker.
                 let status = response.status();
                 worker.record_outcome(status.is_success() || status.is_client_error());
 
@@ -2004,9 +2004,8 @@ mod tests {
 
     #[test]
     fn test_inline_header_conversion_matches_headers_to_request_headers() {
-        // Verify that the inline header conversion pattern used in pd_router and
-        // vllm_pd_router produces the same result as Router::headers_to_request_headers.
-        // This ensures consistency across all three router implementations.
+        // Verify that the inline header conversion pattern used in vllm_pd_router
+        // produces the same result as Router::headers_to_request_headers.
         let mut header_map = HeaderMap::new();
         header_map.insert("X-Session-Id", HeaderValue::from_static("session-abc"));
         header_map.insert("Content-Type", HeaderValue::from_static("application/json"));
@@ -2015,7 +2014,7 @@ mod tests {
         // Method 1: Router::headers_to_request_headers (used in router.rs)
         let method1 = Router::headers_to_request_headers(Some(&header_map)).unwrap();
 
-        // Method 2: Inline conversion (used in pd_router.rs and vllm_pd_router.rs)
+        // Method 2: Inline conversion (used in vllm_pd_router.rs)
         let method2: HashMap<String, String> = header_map
             .iter()
             .filter_map(|(name, value)| {
@@ -2137,7 +2136,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 503);
 
-        // ── Step 1: wait_for_healthy_workers (mirrors PDRouter::new startup) ──
+        // ── Step 1: wait_for_healthy_workers (mirrors PdRouterBase::new startup) ──
         // This succeeds because the healthy worker responds immediately,
         // even though the delayed worker is still returning 503.
         let result =
@@ -2148,7 +2147,7 @@ mod tests {
             "Startup should succeed with at least one healthy worker"
         );
 
-        // ── Step 2: register workers in the registry (mirrors PDRouter::new) ──
+        // ── Step 2: register workers in the registry (mirrors PdRouterBase::new) ──
         let registry = Arc::new(WorkerRegistry::new());
 
         let healthy_worker = Arc::new(
@@ -2183,7 +2182,7 @@ mod tests {
             healthy.len()
         );
 
-        // ── Step 3: start background health checker (mirrors PDRouter::new) ──
+        // ── Step 3: start background health checker (mirrors PdRouterBase::new) ──
         let health_checker = registry.start_health_checker(1);
 
         // ── Step 4: wait for delayed worker to recover ──
